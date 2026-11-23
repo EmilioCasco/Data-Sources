@@ -7,19 +7,25 @@ Qué hace, en resumen:
   2. Entra a la ruta de red:  Año > Mes (nombre) > Día.
   3. Busca los archivos Pr_Saldos_Prestamos_ddmmyyyy y DD_Saldos_Descuentos_ddmmyyyy
      (solo los que cumplen EXACTAMENTE ese formato de nombre).
-  4. Toma las columnas requeridas de cada archivo y las apila en una sola tabla.
-  5. Agrega las columnas No, Documento, Fecha y Archivo.
-  6. Genera un CSV con fecha y hora en el nombre y valida que la cantidad de
-     registros del CSV sea igual a la de los archivos originales.
+  4. VERIFICA que ambos archivos existan y estén actualizados a la MISMA fecha.
+     Si no es así, aborta el proceso con un mensaje de error (no se genera nada).
+  5. Toma las columnas requeridas de cada archivo y las apila en una sola tabla.
+  6. Agrega las columnas No, Documento, Fecha y Archivo.
+  7. Genera Consolidado_Saldos_Descuentos_yyyymmdd.csv (yyyymmdd = fecha hasta la que
+     están actualizados los datos) y valida que la cantidad de registros del CSV
+     sea igual a la de los archivos originales.
+  8. Los mensajes del proceso se muestran en pantalla y se guardan en consolidar_cartera.log
+     (en la carpeta de salida).
 
-Requisitos: pip install pandas openpyxl   (xlrd solo si hubiera archivos .xls)
+Requisitos: pip install pandas openpyxl python-calamine
+            (python-calamine se usa para leer los archivos .xls; reemplaza a xlrd)
 Código de salida: 0 = proceso correcto, 1 = error o validación fallida
 (útil para el Programador de tareas de Windows).
 """
 
 # ------------------------------------------------------------------ IMPORTS
-import logging                      # Para mostrar mensajes en pantalla y guardarlos en un log
-import os                           # Para recorrer carpetas y reemplazar/eliminar archivos
+import logging                      # Para mostrar mensajes en pantalla y armar el log de la ejecución
+import os                           # Para recorrer carpetas
 import re                           # Expresiones regulares: validar el formato exacto del nombre
 import sys                          # Para enviar la salida a pantalla y devolver el código de salida
 import unicodedata                  # Para quitar tildes al comparar nombres de carpetas
@@ -33,9 +39,15 @@ import pandas as pd                 # Lectura de Excel, consolidación y escritu
 RUTA_ORIGEN = r"\\172.23.6.81\Listados2021"
 # Carpeta donde se guarda el CSV consolidado y el log
 RUTA_SALIDA = r"C:\Users\HN39280\Desktop\Cartera\CP"
-# True = antes de crear el nuevo CSV se eliminan los CSV anteriores del mismo mes
-# (así no se acumulan archivos y se mantiene el esquema "delete / insert").
-# Si algún archivo anterior está abierto en Excel, no se puede borrar: solo se avisa.
+
+# Prefijo del archivo de salida: <PREFIJO_SALIDA>_yyyymmdd.csv
+PREFIJO_SALIDA = "Consolidado_Saldos_Descuentos"
+# Archivo de log (se guarda en la carpeta de salida)
+NOMBRE_LOG = "consolidar_cartera.log"
+
+# True = al generar el nuevo CSV también se eliminan los consolidados de OTRAS fechas del
+# mismo mes (así solo queda el más reciente). El de la misma fecha SIEMPRE se elimina y se
+# vuelve a crear. Si algún archivo anterior está abierto en Excel, no se puede borrar: solo se avisa.
 ELIMINAR_ANTERIORES = True
 
 # Nombres de los meses tal como se llaman las carpetas (sin tildes y en minúscula,
@@ -50,17 +62,20 @@ COLS_COMUNES = ["CODIGO_AGENCIA", "CODIGO_SUB_APLICACION", "DESC_MONEDA",
                 "OFICIAL_CREDITO", "AGENCIA_ORIGEN_PRESTAMO", "NOMBRE_AGENCIA"]
 
 # Definición de cada tipo de archivo:
+#   nombre    -> prefijo del archivo (solo se usa en los mensajes)
 #   regex     -> formato EXACTO del nombre: prefijo + ddmmyyyy (8 dígitos) + extensión.
 #                Por eso se descartan nombres como Pr_Saldos_Prestamos_Castigados_03112026
 #   columnas  -> columnas que se leen del Excel
 #   renombrar -> nombre final que tendrá cada columna en el CSV
 TIPOS = {
     "Saldos": {
+        "nombre": "Pr_Saldos_Prestamos",
         "regex": re.compile(r"^Pr_Saldos_Prestamos_(\d{8})\.(xlsx|xlsm|xls)$", re.I),
         "columnas": ["PRESTAMO", "MONTO_INICIAL"] + COLS_COMUNES,
         "renombrar": {"PRESTAMO": "PRESTAMO_NEGOCIACION"},
     },
     "Descuentos": {
+        "nombre": "DD_Saldos_Descuentos",
         "regex": re.compile(r"^DD_Saldos_Descuentos_(\d{8})\.(xlsx|xlsm|xls)$", re.I),
         "columnas": ["NEGOCIACION", "VALOR_INICIAL"] + COLS_COMUNES,
         # Se unifican los nombres para poder apilar ambos archivos en las mismas columnas
@@ -131,8 +146,12 @@ def leer(ruta: Path, tipo: str) -> pd.DataFrame:
     """Lee un Excel y devuelve solo las columnas requeridas, ya con los nombres finales."""
     cfg = TIPOS[tipo]
     requeridas = {c.upper() for c in cfg["columnas"]}              # columnas esperadas, en mayúscula
+    # Los .xls se leen con 'calamine' (xlrd está obsoleto y genera advertencias);
+    # los .xlsx/.xlsm siguen con el motor por defecto (openpyxl)
+    motor = "calamine" if ruta.suffix.lower() == ".xls" else None
     df = pd.read_excel(
         ruta,
+        engine=motor,
         # Lee únicamente las columnas pedidas (ignora el resto: más rápido y liviano)
         usecols=lambda c: str(c).strip().upper() in requeridas,
         # El número de préstamo/negociación se lee como texto para no perder ceros ni formato
@@ -153,42 +172,16 @@ def total_capital(serie: pd.Series) -> float:
 
 
 # ------------------------------------------------------------------ PROCESO PRINCIPAL
-def main() -> int:
-    # ---- Preparación: carpeta de salida y log
-    salida = Path(RUTA_SALIDA)
-    salida.mkdir(parents=True, exist_ok=True)                      # crea la carpeta si no existe
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",            # cada línea lleva fecha/hora y nivel
-        handlers=[logging.FileHandler(salida / "consolidar_cartera.log", encoding="utf-8"),  # al archivo log
-                  logging.StreamHandler(sys.stdout)],              # y a la pantalla
-    )
-    log = logging.info                                             # atajo para escribir mensajes informativos
+def ejecutar(salida: Path) -> int:
+    """Ejecuta todo el proceso. Devuelve 0 si terminó bien y 1 si hubo error."""
+    log = logging.info                                             # atajo para mensajes informativos
 
-    # ---- Fecha de referencia y nombre del archivo de salida
-    ahora = datetime.now()
-    ref = (ahora - timedelta(days=1)).date()                       # datos al día anterior
-    prefijo = f"Cartera_CP_{ref.year}{ref.month:02d}"              # ej.: Cartera_CP_202611
-    # El nombre lleva fecha y hora de ejecución: Cartera_CP_202611_20261123_153045.csv
-    destino = salida / f"{prefijo}_{ahora:%Y%m%d_%H%M%S}.csv"
-
+    # ---- Fecha de referencia
+    ref = (datetime.now() - timedelta(days=1)).date()              # datos al día anterior
     log("=== INICIO DEL PROCESO === Fecha de referencia: %s", ref)
 
-    # ---- PASO 1: eliminar CSV anteriores del mismo mes (delete)
-    log("[1/5] Eliminando archivos generados anteriormente...")
-    if ELIMINAR_ANTERIORES:
-        previos = list(salida.glob(f"{prefijo}*.csv"))             # CSV previos del mes en proceso
-        for p in previos:
-            try:
-                p.unlink()                                         # elimina el archivo
-                log("      Eliminado: %s", p.name)
-            except PermissionError:                                # abierto en Excel u otro programa
-                logging.warning("      No se pudo eliminar %s (¿está abierto?). Se continúa.", p.name)
-        if not previos:
-            log("      No existían archivos previos.")
-
-    # ---- PASO 2: ubicar carpetas y archivos de origen
-    log("[2/5] Buscando carpetas y archivos de origen...")
+    # ---- PASO 1: ubicar carpetas y archivos de origen
+    log("[1/5] Buscando carpetas y archivos de origen...")
     carpeta_anio = buscar_subcarpeta(Path(RUTA_ORIGEN), {str(ref.year)})   # carpeta del año, ej. "2026"
     if not carpeta_anio:
         logging.error("No existe la carpeta del año %s en %s", ref.year, RUTA_ORIGEN)
@@ -214,23 +207,47 @@ def main() -> int:
         logging.error("No se encontraron archivos válidos en %s", carpeta_mes)
         return 1
 
-    fechas = sorted({f for _, f in archivos})                      # fechas distintas encontradas
-    log("      Archivos válidos: %d | Último día cargado: %s (desde %s)",
-        len(archivos), fechas[-1], fechas[0])                      # fechas[-1] = último archivo del mes
+    # ---- PASO 2: verificar que AMBOS archivos existan y estén a la misma fecha
+    log("[2/5] Verificando que ambos archivos originales existan y estén a la misma fecha...")
+    ultima = {}                                                    # última fecha disponible de cada tipo
+    for tipo, cfg in TIPOS.items():
+        fechas_tipo = [f for (t, f) in archivos if t == tipo]
+        if not fechas_tipo:                                        # no hay ningún archivo de este tipo
+            logging.error("ERROR: no existe ningún archivo %s_ddmmyyyy en el mes %s. "
+                          "Se aborta el proceso.", cfg["nombre"], MESES[ref.month - 1])
+            return 1
+        ultima[tipo] = max(fechas_tipo)
+        log("      %s: última fecha disponible %s", cfg["nombre"], ultima[tipo].strftime("%d/%m/%Y"))
+    if len(set(ultima.values())) != 1:                             # las fechas más recientes no coinciden
+        detalle = " | ".join(f"{TIPOS[t]['nombre']} al {f.strftime('%d/%m/%Y')}" for t, f in ultima.items())
+        logging.error("ERROR: los archivos originales NO están actualizados a la misma fecha (%s). "
+                      "No se puede consolidar. Se aborta el proceso.", detalle)
+        return 1
+    fecha_datos = ultima["Saldos"]                                 # fecha hasta la que están actualizados los datos
+    log("      OK: ambos archivos existen y están al %s", fecha_datos.strftime("%d/%m/%Y"))
+    # Aviso si ambos archivos de esa fecha no están en la misma carpeta de día
+    if archivos[("Saldos", fecha_datos)].parent != archivos[("Descuentos", fecha_datos)].parent:
+        logging.warning("      Los archivos del %s están en carpetas distintas.", fecha_datos.strftime("%d/%m/%Y"))
 
+    fechas = sorted({f for _, f in archivos})                      # todas las fechas encontradas en el mes
+    log("      Archivos válidos: %d | Rango: %s a %s",
+        len(archivos), fechas[0].strftime("%d/%m/%Y"), fecha_datos.strftime("%d/%m/%Y"))
     # Informativo: días hábiles (lun-vie) sin archivo. Fines de semana no se reportan.
     d, faltantes = fechas[0].replace(day=1), []
-    while d <= fechas[-1]:
+    while d <= fecha_datos:
         if d.weekday() < 5 and d not in fechas:                    # weekday < 5 = lunes a viernes
             faltantes.append(d.strftime("%d/%m"))
         d += timedelta(days=1)
     if faltantes:
         log("      Días hábiles sin archivo (feriados u omisiones): %s", ", ".join(faltantes))
-    # Aviso si una fecha tiene un tipo de archivo pero le falta el otro
+    # Aviso si una fecha intermedia tiene un tipo de archivo pero le falta el otro
     for f in fechas:
-        for tipo in TIPOS:
+        for tipo, cfg in TIPOS.items():
             if (tipo, f) not in archivos:
-                logging.warning("      Falta archivo de %s para la fecha %s", tipo, f)
+                logging.warning("      Falta %s para la fecha %s", cfg["nombre"], f.strftime("%d/%m/%Y"))
+
+    # Nombre del archivo de salida: la fecha es la de los datos (no la de ejecución)
+    destino = salida / f"{PREFIJO_SALIDA}_{fecha_datos:%Y%m%d}.csv"
 
     # ---- PASO 3: leer cada archivo
     log("[3/5] Leyendo archivos...")
@@ -248,13 +265,27 @@ def main() -> int:
         partes.append(df)
         log("            %d registros", len(df))
 
-    # ---- PASO 4: consolidar y generar el CSV (insert)
+    # ---- PASO 4: consolidar, eliminar el archivo anterior (delete) y generar el CSV (insert)
     log("[4/5] Consolidando datos y generando CSV (puede tardar)...")
     final = pd.concat(partes, ignore_index=True)                   # apila todas las tablas en una sola
     del partes                                                     # libera memoria
     final.insert(0, "No", range(1, len(final) + 1))                # correlativo de línea desde 1
     final = final[ORDEN_FINAL]                                     # ordena las columnas
-    # utf-8-sig: Excel reconoce bien tildes y ñ; date_format: fechas como dd/mm/yyyy
+
+    # Delete: el archivo con el MISMO nombre siempre se elimina; los de otras fechas del mes, según configuración
+    for p in sorted(salida.glob(f"{PREFIJO_SALIDA}_{fecha_datos:%Y%m}??.csv")):
+        if p != destino and not ELIMINAR_ANTERIORES:
+            continue
+        try:
+            p.unlink()                                             # elimina el archivo
+            log("      Eliminado: %s", p.name)
+        except PermissionError:                                    # abierto en Excel u otro programa
+            if p == destino:                                       # sin borrarlo no se puede recrear
+                logging.error("No se pudo eliminar %s (¿está abierto?). Ciérrelo y reintente.", p.name)
+                return 1
+            logging.warning("      No se pudo eliminar %s (¿está abierto?). Se continúa.", p.name)
+
+    # Insert: utf-8-sig hace que Excel reconozca tildes y ñ; date_format escribe las fechas como dd/mm/yyyy
     final.to_csv(destino, index=False, encoding="utf-8-sig", date_format="%d/%m/%Y")
     total_generado = len(final)                                    # filas que se escribieron
     del final
@@ -281,25 +312,42 @@ def main() -> int:
     if not (total_origen == total_generado == total_csv):          # los tres conteos deben coincidir
         ok = False
 
-    print()
     log("Archivos procesados       : %d", len(control))
     log("Total registros originales: %s", f"{total_origen:,}")
     log("Total registros en CSV    : %s", f"{total_csv:,}")
 
     if not ok:
         logging.error("PROCESO TERMINADO CON ERRORES: la cantidad de registros NO coincide.")
+        try:
+            destino.unlink()                                       # no se deja un CSV que no pasó la validación
+            logging.error("Se eliminó %s para que no sea utilizado.", destino.name)
+        except OSError:
+            logging.error("No se pudo eliminar %s; NO lo utilice.", destino.name)
         return 1
 
     log("Validación correcta: la cantidad de registros coincide.")
+    log("Datos actualizados hasta el %s", fecha_datos.strftime("%d/%m/%Y"))
     log("=== PROCESO CONCLUIDO CON EXITO === %s", destino)
     return 0
 
 
-# ------------------------------------------------------------------ PUNTO DE ENTRADA
-if __name__ == "__main__":
+def main() -> int:
+    salida = Path(RUTA_SALIDA)
+    salida.mkdir(parents=True, exist_ok=True)                      # crea la carpeta de salida si no existe
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",            # cada línea lleva fecha/hora y nivel
+        handlers=[logging.FileHandler(salida / NOMBRE_LOG, encoding="utf-8"),  # al archivo log
+                  logging.StreamHandler(sys.stdout)],              # y a la pantalla
+    )
     try:
-        sys.exit(main())                                           # ejecuta y devuelve 0 (OK) o 1 (error)
+        return ejecutar(salida)
     except Exception:
         # Cualquier error inesperado (red caída, columna faltante, etc.) queda en pantalla y en el log
         logging.exception("PROCESO TERMINADO CON ERRORES (error no controlado)")
-        sys.exit(1)
+        return 1
+
+
+# ------------------------------------------------------------------ PUNTO DE ENTRADA
+if __name__ == "__main__":
+    sys.exit(main())                                               # devuelve 0 (OK) o 1 (error)
