@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 """
+Fecha: 23/11/2026
+
 CONSOLIDADOR DE CARTERA (Saldos de Préstamos + Saldos de Descuentos)
 =====================================================================
 Qué hace, en resumen:
@@ -14,7 +16,7 @@ Qué hace, en resumen:
   7. Genera Consolidado_Saldos_Descuentos_yyyymmdd.csv (yyyymmdd = fecha hasta la que
      están actualizados los datos) y valida que la cantidad de registros del CSV
      sea igual a la de los archivos originales.
-  8. Los mensajes del proceso se muestran en pantalla y se guardan en consolidar_cartera.log
+  8. Los mensajes del proceso se muestran en pantalla y se guardan en Consolidado_Log.log
      (en la carpeta de salida).
 
 Requisitos: pip install pandas openpyxl python-calamine
@@ -36,19 +38,22 @@ import pandas as pd                 # Lectura de Excel, consolidación y escritu
 
 # ------------------------------------------------------------------ CONFIGURACIÓN
 # Ruta de red donde están las carpetas por año (ruta UNC completa, con doble barra inicial)
+#RUTA_ORIGEN = r"C:\Users\HN39280\Desktop\Cartera\CP"
 RUTA_ORIGEN = r"\\172.23.6.81\Listados2021"
+
+
 # Carpeta donde se guarda el CSV consolidado y el log
 RUTA_SALIDA = r"C:\Users\HN39280\Desktop\Cartera\CP"
 
 # Prefijo del archivo de salida: <PREFIJO_SALIDA>_yyyymmdd.csv
-PREFIJO_SALIDA = "Consolidado_Saldos_Descuentos"
+PREFIJO_SALIDA = "ConsolidadoMensual_Prestamos"
 # Archivo de log (se guarda en la carpeta de salida)
-NOMBRE_LOG = "consolidar_cartera.log"
+NOMBRE_LOG = "Consolidado_Log.log"
 
 # True = al generar el nuevo CSV también se eliminan los consolidados de OTRAS fechas del
 # mismo mes (así solo queda el más reciente). El de la misma fecha SIEMPRE se elimina y se
 # vuelve a crear. Si algún archivo anterior está abierto en Excel, no se puede borrar: solo se avisa.
-ELIMINAR_ANTERIORES = True
+ELIMINAR_ANTERIORES = False
 
 # Nombres de los meses tal como se llaman las carpetas (sin tildes y en minúscula,
 # porque al comparar se normaliza el nombre real de la carpeta)
@@ -166,7 +171,7 @@ def leer(ruta: Path, tipo: str) -> pd.DataFrame:
 
 
 def total_capital(serie: pd.Series) -> float:
-    """Suma de CAPITAL_TOTAL (valores no numéricos cuentan como 0).
+    """Conteo de registros (valores no numéricos cuentan como 0).
     Se usa como control adicional además del conteo de registros."""
     return float(pd.to_numeric(serie, errors="coerce").fillna(0).sum())
 
@@ -252,18 +257,60 @@ def ejecutar(salida: Path) -> int:
     # ---- PASO 3: leer cada archivo
     log("[3/5] Leyendo archivos...")
     claves = sorted(archivos, key=lambda k: (k[1], k[0]))          # orden por fecha y luego por tipo
-    partes, control = [], {}                                       # partes = tablas leídas; control = conteos originales
+    partes, control = [], {} 
+    
+    fechas_invalidas = set()
+
     for i, (tipo, fecha) in enumerate(claves, 1):
         ruta = archivos[(tipo, fecha)]
-        log("      (%d/%d) Leyendo %s ...", i, len(claves), ruta.name)   # avance archivo por archivo
-        df = leer(ruta, tipo)
-        # Se guarda el conteo y la suma de capital del ORIGINAL para validar después
-        control[ruta.name] = {"filas": len(df), "capital": total_capital(df["CAPITAL_TOTAL"])}
-        df.insert(0, "Archivo", ruta.name)                         # nombre del archivo de origen
-        df.insert(0, "Fecha", pd.Timestamp(fecha))                 # fecha tomada del nombre del archivo
-        df.insert(0, "Documento", tipo)                            # "Saldos" o "Descuentos"
+        
+        if fecha in fechas_invalidas:
+            continue
+
+        log("      (%d/%d) Leyendo %s ...", i, len(claves), ruta.name)
+
+        try:
+            df = leer(ruta, tipo)
+        except ValueError as e:
+            logging.warning("%s", e)
+            
+            fechas_invalidas.add(fecha)
+            
+            partes = [
+                p for p in partes
+                if p["Fecha"].iloc[0].date() != fecha
+            ]
+
+            control = {
+                k: v
+                for k, v in control.items()
+                if fecha.strftime("%d%m%Y") not in k
+            }
+
+            logging.warning(
+                "Se omite completamente la fecha %s por columnas faltantes.",
+                fecha.strftime("%d/%m/%Y")
+                )
+
+            continue
+
+        control[ruta.name] = {
+            "filas": len(df),
+            "capital": total_capital(df["CAPITAL_TOTAL"])
+        }
+
+        df.insert(0, "Archivo", ruta.name)
+        df.insert(0, "Fecha", pd.Timestamp(fecha))
+        df.insert(0, "Documento", tipo)
+
         partes.append(df)
         log("            %d registros", len(df))
+
+    if fechas_invalidas:
+        logging.warning(
+            "Fechas excluidas por estructura inválida: %s",
+            ", ".join(f.strftime("%d/%m/%Y") for f in sorted(fechas_invalidas))
+    )
 
     # ---- PASO 4: consolidar, eliminar el archivo anterior (delete) y generar el CSV (insert)
     log("[4/5] Consolidando datos y generando CSV (puede tardar)...")
