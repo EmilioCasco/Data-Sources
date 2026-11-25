@@ -2,7 +2,7 @@
 =============================
 CONSOLIDA ASIENTOS CONTABLES 
 =============================
-Fecha: 25/11/2026
+Fecha: 24/11/2026
 Version: 1.0
 
 Consolida los siguientes archivos:
@@ -24,8 +24,8 @@ import pandas as pd                 # Lectura de Excel, consolidación y escritu
 
 # ------------------------------------------------------------------ CONFIGURACIÓN
 # Ruta de red donde están las carpetas por año (ruta UNC completa, con doble barra inicial)
-RUTA_ORIGEN = r"C:\Users\HN39280\Desktop\Cartera\AsientosContables"
-#RUTA_ORIGEN = r"\\172.23.6.81\Listados2021"
+#RUTA_ORIGEN = r"C:\Users\HN39280\Desktop\Cartera\AsientosContables"
+RUTA_ORIGEN = r"\\172.23.6.81\Listados2021"
 
 
 # Carpeta donde se guarda el CSV consolidado y el log
@@ -152,6 +152,10 @@ def leer(ruta: Path, tipo: str) -> pd.DataFrame:
             dtype=str
         )
 
+        for col in ["FECHA_MOVIMIENTO", "FECHA_VALIDA"]:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+
         df.columns = [str(c).strip().upper() for c in df.columns]
 
         faltan = requeridas - set(df.columns)
@@ -175,15 +179,20 @@ def leer(ruta: Path, tipo: str) -> pd.DataFrame:
     for nombre_hoja, df in hojas.items():
         if df.empty:
             continue
-
+        
         df.columns = [str(c).strip().upper() for c in df.columns]
+
+        for col in ["FECHA_MOVIMIENTO", "FECHA_VALIDA"]:
+                            if col in df.columns:
+                                df[col] = pd.to_datetime(df[col], errors="coerce")
+        
         faltan = requeridas - set(df.columns)
 
         if faltan:
             raise ValueError(
                 f"{ruta.name} | Hoja '{nombre_hoja}': faltan columnas {sorted(faltan)}"
             )
-
+        
         dfs.append(
             df[cfg["columnas"]].rename(columns=cfg["renombrar"])
         )
@@ -349,26 +358,6 @@ def ejecutar(salida: Path) -> int:
         }
 
     log("Registros después del filtro: %s", f"{len(final):,}")
-
-    fechas = [
-        "FECHA_MOVIMIENTO",
-        "FECHA_VALIDA",
-        "Fecha"
-    ]
-
-    for col in fechas:
-        final[col] = (
-            final[col]
-            .astype(str)
-            .str.replace(" 00:00:00", "", regex=False)
-            .str.strip()
-        )
-        
-        final[col] = pd.to_datetime(
-            final[col],
-            dayfirst=True,
-            errors="coerce"
-    )
     
     decimales = [
             "MONTO_COMPROBANTE",
@@ -432,6 +421,10 @@ def ejecutar(salida: Path) -> int:
     # Insert: utf-8-sig hace que Excel reconozca tildes y ñ; date_format escribe las fechas como dd/mm/yyyy
     #final.to_csv(destino, index=False, encoding="utf-8-sig", date_format="%d/%m/%Y")
 
+    for col in ["FECHA_MOVIMIENTO", "FECHA_VALIDA"]:
+        final[col] = pd.to_datetime(final[col], errors="coerce")
+        #antes de exportar
+        
     with pd.ExcelWriter(destino, 
                         engine="openpyxl"
                         ) as writer:
@@ -461,32 +454,11 @@ def ejecutar(salida: Path) -> int:
             
                 for cell in col_cells:
                     cell.number_format = "#,##0.00"
-    # Fechas
-        for col in ["FECHA_MOVIMIENTO", "FECHA_VALIDA", "Fecha"]:
-            final[col] = (
-                final[col]
-                .astype(str)
-                .str.replace(" 00:00:00", "", regex=False)
-                .str.strip()
-            )
-
-            final[col] = pd.to_datetime(
-                final[col],
-                format="%m/%d/%Y",
-                errors="coerce"
-            )
-
-            mascara = final[col].isna()
-
-            final.loc[mascara, col] = pd.to_datetime(
-                final.loc[mascara, col].astype(str),
-                format="%d/%m/%Y",
-                errors="coerce"
-                )
-
+ 
         total_generado = len(final)
     log("      XLS generado: %s", destino) 
 
+    
     # ---- PASO 5: validar contra el archivo ya escrito en disco
     log("[5/5] Validando registros entre archivos filtrados y XLS generado...")
     conteo, capital = {}, {}                                       # lo que realmente quedó en el CSV
