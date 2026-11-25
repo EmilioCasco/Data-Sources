@@ -135,71 +135,69 @@ def localizar_archivos(carpeta_mes: Path):
     return encontrados, descartados
 
 
+FECHAS = ["FECHA_MOVIMIENTO", "FECHA_VALIDA"]
+FORMATOS_FECHA = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d",
+                  "%d/%m/%Y %H:%M:%S", "%d/%m/%Y", "%d-%m-%Y", "%Y%m%d")
+
+
+def parsear_fecha(serie: pd.Series) -> pd.Series:
+    """Convierte fechas que llegan como texto, serial de Excel o datetime."""
+    s = serie.astype("string").str.strip()
+    out = pd.Series(pd.NaT, index=serie.index, dtype="datetime64[ns]")
+
+    # 1) Serial de Excel (ej. "46349" o "46349.0")
+    num = pd.to_numeric(s, errors="coerce")
+    es_serial = num.between(20000, 80000).fillna(False)
+    if es_serial.any():
+        out[es_serial] = pd.to_datetime(num[es_serial], unit="D", origin="1899-12-30")
+
+    # 2) Texto: se prueba cada formato solo sobre lo que sigue sin convertir
+    for fmt in FORMATOS_FECHA:
+        pend = s.notna() & ~es_serial & out.isna()
+        if not pend.any():
+            break
+        out[pend] = pd.to_datetime(s[pend], format=fmt, errors="coerce")
+    return out
+
+
+def _preparar(df: pd.DataFrame, cfg: dict, etiqueta: str) -> pd.DataFrame:
+    """Normaliza encabezados, valida columnas, convierte fechas y deja los nombres finales."""
+    df.columns = [str(c).strip().upper() for c in df.columns]      # primero encabezados
+    faltan = {c.upper() for c in cfg["columnas"]} - set(df.columns)
+    if faltan:
+        raise ValueError(f"{etiqueta}: faltan columnas {sorted(faltan)}")
+    for col in FECHAS:                                             # luego fechas
+        df[col] = parsear_fecha(df[col])
+        vacias = int(df[col].isna().sum())
+        if vacias:
+            logging.warning("%s: %s con %d fechas vacías/sin convertir de %d",
+                            etiqueta, col, vacias, len(df))
+    return df[cfg["columnas"]].rename(columns=cfg["renombrar"])
+
+
 def leer(ruta: Path, tipo: str) -> pd.DataFrame:
     """Lee un Excel y devuelve solo las columnas requeridas, ya con los nombres finales."""
     cfg = TIPOS[tipo]
     requeridas = {c.upper() for c in cfg["columnas"]}              # columnas esperadas, en mayúscula
+    filtro = lambda c: str(c).strip().upper() in requeridas
+
     # Los .xls se leen con 'calamine' (xlrd está obsoleto y genera advertencias);
     # los .xlsx/.xlsm siguen con el motor por defecto (openpyxl)
     motor = "calamine" if ruta.suffix.lower() == ".xls" else None
 
     # BDD: solo primera hoja
     if tipo == "Asientos Contables BDD":
-        df = pd.read_excel(
-            ruta,
-            engine=motor,
-            usecols=lambda c: str(c).strip().upper() in requeridas,
-            dtype=str
-        )
+        df = pd.read_excel(ruta, engine=motor, usecols=filtro, dtype=str)
+        return _preparar(df, cfg, ruta.name)
 
-        for col in ["FECHA_MOVIMIENTO", "FECHA_VALIDA"]:
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col], errors="coerce")
-
-        df.columns = [str(c).strip().upper() for c in df.columns]
-
-        faltan = requeridas - set(df.columns)
-
-        if faltan:
-            raise ValueError(f"{ruta.name}: faltan columnas {sorted(faltan)}")
-
-        return df[cfg["columnas"]].rename(columns=cfg["renombrar"])
-
-# BPR: leer todas las hojas
-    hojas = pd.read_excel(
-        ruta,
-        sheet_name=None,
-        engine=motor,
-        usecols=lambda c: str(c).strip().upper() in requeridas,
-        dtype=str
-    )
-
-    dfs = []
-
-    for nombre_hoja, df in hojas.items():
-        if df.empty:
-            continue
-        
-        df.columns = [str(c).strip().upper() for c in df.columns]
-
-        for col in ["FECHA_MOVIMIENTO", "FECHA_VALIDA"]:
-                            if col in df.columns:
-                                df[col] = pd.to_datetime(df[col], errors="coerce")
-        
-        faltan = requeridas - set(df.columns)
-
-        if faltan:
-            raise ValueError(
-                f"{ruta.name} | Hoja '{nombre_hoja}': faltan columnas {sorted(faltan)}"
-            )
-        
-        dfs.append(
-            df[cfg["columnas"]].rename(columns=cfg["renombrar"])
-        )
-
+    # BPR: leer todas las hojas
+    hojas = pd.read_excel(ruta, sheet_name=None, engine=motor, usecols=filtro, dtype=str)
+    dfs = [_preparar(df, cfg, f"{ruta.name} | Hoja '{nombre_hoja}'")
+           for nombre_hoja, df in hojas.items() if not df.empty]
     if not dfs:
         raise ValueError(f"{ruta.name}: no contiene registros válidos")
     return pd.concat(dfs, ignore_index=True)
+
 
 def total_registros(serie: pd.Series) -> float:
     """Conteo de NUMERO_COMPROBANTE (valores no numéricos cuentan como 0).
@@ -421,10 +419,6 @@ def ejecutar(salida: Path) -> int:
     # Insert: utf-8-sig hace que Excel reconozca tildes y ñ; date_format escribe las fechas como dd/mm/yyyy
     #final.to_csv(destino, index=False, encoding="utf-8-sig", date_format="%d/%m/%Y")
 
-    for col in ["FECHA_MOVIMIENTO", "FECHA_VALIDA"]:
-        final[col] = pd.to_datetime(final[col], errors="coerce")
-        #antes de exportar
-        
     with pd.ExcelWriter(destino, 
                         engine="openpyxl"
                         ) as writer:
@@ -455,6 +449,13 @@ def ejecutar(salida: Path) -> int:
                 for cell in col_cells:
                     cell.number_format = "#,##0.00"
  
+        # Fechas
+        for columna in FECHAS:
+            idx = final.columns.get_loc(columna) + 1
+            for col_cells in ws.iter_cols(min_col=idx, max_col=idx, min_row=2):
+                for cell in col_cells:
+                    cell.number_format = "dd/mm/yyyy"
+
         total_generado = len(final)
     log("      XLS generado: %s", destino) 
 
