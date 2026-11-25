@@ -2,7 +2,7 @@
 =============================
 CONSOLIDA ASIENTOS CONTABLES 
 =============================
-Fecha: 24/11/2026
+Fecha: 25/11/2026
 Version: 1.0
 
 Consolida los siguientes archivos:
@@ -24,15 +24,15 @@ import pandas as pd                 # Lectura de Excel, consolidación y escritu
 
 # ------------------------------------------------------------------ CONFIGURACIÓN
 # Ruta de red donde están las carpetas por año (ruta UNC completa, con doble barra inicial)
-#RUTA_ORIGEN = r"C:\Users\HN39280\Desktop\Cartera\AsientosContables"
-RUTA_ORIGEN = r"\\172.23.6.81\Listados2021"
+RUTA_ORIGEN = r"C:\Users\HN39280\Desktop\Cartera\AsientosContables"
+#RUTA_ORIGEN = r"\\172.23.6.81\Listados2021"
 
 
 # Carpeta donde se guarda el CSV consolidado y el log
 RUTA_SALIDA = r"C:\Users\HN39280\Desktop\Cartera\CP"
 
 # Prefijo del archivo de salida: <PREFIJO_SALIDA>_yyyymmdd.csv
-PREFIJO_SALIDA = "Asientos_Contables"
+PREFIJO_SALIDA = "Consolidado_Asientos_Contables"
 # Archivo de log (se guarda en la carpeta de salida)
 NOMBRE_LOG = "AsientosContables_Log.log"
 
@@ -350,12 +350,74 @@ def ejecutar(salida: Path) -> int:
 
     log("Registros después del filtro: %s", f"{len(final):,}")
 
+    fechas = [
+        "FECHA_MOVIMIENTO",
+        "FECHA_VALIDA",
+        "Fecha"
+    ]
+
+    for col in fechas:
+        final[col] = (
+            final[col]
+            .astype(str)
+            .str.replace(" 00:00:00", "", regex=False)
+            .str.strip()
+        )
+        
+        final[col] = pd.to_datetime(
+            final[col],
+            dayfirst=True,
+            errors="coerce"
+    )
+    
+    decimales = [
+            "MONTO_COMPROBANTE",
+            "MONTO_MONEDA_LOCAL",
+            "VALOR_CAMBIO",
+            "VALOR_CAMBIO_VAL"
+            ]
+    
+    for col in decimales:
+                final[col] = pd.to_numeric(final[col], errors="coerce")
+    
+    enteros = [
+     
+            "NUMERO_COMPROBANTE",
+            "NUMERO_TRANSACCION",
+            "CODIGO_EMPRESA",
+            "CODIGO_AGENCIA",
+            "CODIGO_SUB_APLICACION",
+            "CODIGO_MONEDA",
+            "CODIGO_APLICACION",
+            "CODIGO_CONCENTRADOR",
+            "NUMERO_PRESTAMO",
+            "CODIGO_TIPO_TRANSACCION",
+            "CODIGO_TIPO_OPERACION",
+            "CODIGO_TIPO_SALDO",
+            "CODIGO_TIPO_SALDO_ANTERIOR",
+            "NIVEL_1_CUENTA_CONT",
+            "NIVEL_2_CUENTA_CONT",
+            "NIVEL_3_CUENTA_CONT",
+            "NIVEL_4_CUENTA_CONT",
+            "NIVEL_5_CUENTA_CONT",
+            "NIVEL_6_CUENTA_CONT",
+            "NIVEL_7_CUENTA_CONT",
+            "NIVEL_8_CUENTA_CONT"
+        ]
+    
+    for col in enteros:
+            final[col] = pd.to_numeric(
+                final[col],
+                errors="coerce"
+            ).astype("Int64")
+
+
     del partes                                                     # libera memoria
     final.insert(0, "No", range(1, len(final) + 1))                # correlativo de línea desde 1
     final = final[ORDEN_FINAL]                                     # ordena las columnas
 
     # Delete: el archivo con el MISMO nombre siempre se elimina; los de otras fechas del mes, según configuración
-    for p in sorted(salida.glob(f"{PREFIJO_SALIDA}_{fecha_datos:%Y%m}??.csv")):
+    for p in sorted(salida.glob(f"{PREFIJO_SALIDA}_{fecha_datos:%Y%m}??.xlsx")):
         if p != destino and not ELIMINAR_ANTERIORES:
             continue
         try:
@@ -368,18 +430,62 @@ def ejecutar(salida: Path) -> int:
             logging.warning("      No se pudo eliminar %s (¿está abierto?). Se continúa.", p.name)
 
     # Insert: utf-8-sig hace que Excel reconozca tildes y ñ; date_format escribe las fechas como dd/mm/yyyy
-    final.to_csv(destino, index=False, encoding="utf-8-sig", date_format="%d/%m/%Y")
+    #final.to_csv(destino, index=False, encoding="utf-8-sig", date_format="%d/%m/%Y")
 
-    with pd.ExcelWriter(destino, engine="openpyxl") as writer:
+    with pd.ExcelWriter(destino, 
+                        engine="openpyxl"
+                        ) as writer:
+        
         final.to_excel(
             writer,
-            sheet_name="Asientos Contables",
+            sheet_name="Comprobantes Contables",
             index=False
-    )
-   
-    total_generado = len(final)                                    # filas que se escribieron
-    del final
-    log("      XLS generado: %s", destino)
+        )
+
+        ws = writer.sheets["Comprobantes Contables"]
+
+    # Decimales
+        for columna in [
+            "MONTO_COMPROBANTE",
+            "MONTO_MONEDA_LOCAL",
+            "VALOR_CAMBIO",
+            "VALOR_CAMBIO_VAL"
+        ]:
+            idx = final.columns.get_loc(columna) + 1
+
+            for col_cells in ws.iter_cols(
+                min_col=idx,
+                max_col=idx,
+                min_row=2
+            ):
+            
+                for cell in col_cells:
+                    cell.number_format = "#,##0.00"
+    # Fechas
+        for col in ["FECHA_MOVIMIENTO", "FECHA_VALIDA", "Fecha"]:
+            final[col] = (
+                final[col]
+                .astype(str)
+                .str.replace(" 00:00:00", "", regex=False)
+                .str.strip()
+            )
+
+            final[col] = pd.to_datetime(
+                final[col],
+                format="%m/%d/%Y",
+                errors="coerce"
+            )
+
+            mascara = final[col].isna()
+
+            final.loc[mascara, col] = pd.to_datetime(
+                final.loc[mascara, col].astype(str),
+                format="%d/%m/%Y",
+                errors="coerce"
+                )
+
+        total_generado = len(final)
+    log("      XLS generado: %s", destino) 
 
     # ---- PASO 5: validar contra el archivo ya escrito en disco
     log("[5/5] Validando registros entre archivos filtrados y XLS generado...")
@@ -388,7 +494,7 @@ def ejecutar(salida: Path) -> int:
     # Se relee el CSV por bloques (chunks) para no cargar todo en memoria
     validacion = pd.read_excel(
         destino,
-        sheet_name="Asientos Contables",
+        sheet_name="Comprobantes Contables",
         usecols=["Archivo", "NUMERO_COMPROBANTE"],
         dtype=str,
         engine="openpyxl"
@@ -411,8 +517,8 @@ def ejecutar(salida: Path) -> int:
         ok = False
 
     log("Archivos procesados       : %d", len(archivos))
-    log("Total registros originales: %s", f"{total_origen:,}")
-    log("Total registros en CSV    : %s", f"{total_xls:,}")
+    log("Total registros originales filtrados: %s", f"{total_origen:,}")
+    log("Total registros en .xlsx    : %s", f"{total_xls:,}")
 
     if not ok:
         logging.error("PROCESO TERMINADO CON ERRORES: la cantidad de registros NO coincide.")
